@@ -25,14 +25,14 @@ class Bot:
 
         # Panic-spawner settings
         self.enemy_threat_radius: int = 3
-        self.panic_spawner_cooldown: int = 30
+        self.panic_spawner_cooldown: int = 30  # don't do it every tick
         self._last_panic_spawner_tick: int = -10**9
 
-        # NEW: only do the “spawner on every starting tile” once
+        # Tick 0 spawner burst
         self._did_initial_spawner_burst: bool = False
 
         # Pathfinding knobs
-        self.astar_max_expansions: int = 4000
+        self.astar_max_expansions: int = 4000  # safety cap so we don't explode CPU
 
     # ---------- basic helpers ----------
 
@@ -50,6 +50,7 @@ class Bot:
         return 0 <= x < w and 0 <= y < h
 
     def _adjacent_positions(self, x: int, y: int) -> list[tuple[int, int, Position]]:
+        # 4-neighbors with direction vectors for SporeMoveAction
         return [
             (x, y - 1, Position(x=0, y=-1)),
             (x, y + 1, Position(x=0, y=1)),
@@ -66,6 +67,7 @@ class Bot:
         }
 
     def _neutral_spore_biomass_by_pos(self, game_message: TeamGameState) -> dict[tuple[int, int], int]:
+        """Map (x,y) -> neutral biomass (used to pick cheapest adjacent neutral)."""
         neutral_id = game_message.constants.neutralTeamId
         out: dict[tuple[int, int], int] = {}
         for sp in game_message.world.spores:
@@ -74,6 +76,7 @@ class Bot:
         return out
 
     def _enemy_spore_positions(self, game_message: TeamGameState) -> set[tuple[int, int]]:
+        # "Enemy" here means any non-neutral, non-us spore
         my_id = game_message.yourTeamId
         neutral_id = game_message.constants.neutralTeamId
         out: set[tuple[int, int]] = set()
@@ -83,6 +86,7 @@ class Bot:
         return out
 
     def _enemy_spawner_positions(self, game_message: TeamGameState) -> set[tuple[int, int]]:
+        """All enemy spawner tile positions."""
         my_id = game_message.yourTeamId
         neutral_id = game_message.constants.neutralTeamId
         out: set[tuple[int, int]] = set()
@@ -97,6 +101,7 @@ class Bot:
     # ---------- threat + panic spawner ----------
 
     def _enemy_nearby(self, game_message: TeamGameState, enemy_pos: set[tuple[int, int]]) -> bool:
+        """True if any enemy spore is within enemy_threat_radius of any of our spores."""
         my_team: TeamInfo = game_message.world.teamInfos[game_message.yourTeamId]
         if not enemy_pos or not my_team.spores:
             return False
@@ -114,6 +119,10 @@ class Bot:
         game_message: TeamGameState,
         enemy_pos: set[tuple[int, int]],
     ) -> Optional[Spore]:
+        """
+        Choose the spore that is farthest from the nearest enemy spore.
+        That approximates "somewhere else" (safer backline).
+        """
         my_team: TeamInfo = game_message.world.teamInfos[game_message.yourTeamId]
         if not my_team.spores:
             return None
@@ -134,6 +143,7 @@ class Bot:
         spore: Spore,
         neutral_pos: set[tuple[int, int]],
     ) -> list[tuple[Position, Position]]:
+        """Return adjacent neutral tiles and the direction to move into them."""
         x, y = spore.position.x, spore.position.y
         hits: list[tuple[Position, Position]] = []
         for nx, ny, dvec in self._adjacent_positions(x, y):
@@ -183,6 +193,10 @@ class Bot:
         search_radius: int = 25,
         samples_outside: int = 80,
     ) -> Optional[Position]:
+        """
+        Prefer unvisited tiles, nutrient-biased.
+        Avoid blocked tiles (neutrals/enemies, enemy spawners).
+        """
         world = game_message.world
         w, h = world.map.width, world.map.height
         nutrient = world.map.nutrientGrid
@@ -236,6 +250,10 @@ class Bot:
         neutral_pos: set[tuple[int, int]],
         neutral_biomass: dict[tuple[int, int], int],
     ) -> tuple[Optional[str], Optional[SporeMoveAction]]:
+        """
+        Sacrifice mode (when surrounded by neutrals): pick lowest-biomass spore,
+        ram cheapest adjacent neutral.
+        """
         candidates: list[tuple[Spore, tuple[Position, Position]]] = []
 
         for sp in my_spores:
@@ -262,6 +280,7 @@ class Bot:
     # ---------- A* pathfinding ----------
 
     def _heuristic(self, ax: int, ay: int, bx: int, by: int) -> int:
+        # Manhattan distance (perfect for 4-neighbor grid without diagonal moves)
         return abs(ax - bx) + abs(ay - by)
 
     def _astar_next_step(
@@ -272,23 +291,30 @@ class Bot:
         blocked: set[tuple[int, int]],
         allow_goal_even_if_blocked: bool = False,
     ) -> Optional[Position]:
+        """
+        Returns the direction vector (Position) for the next step from start toward goal using A*.
+        If no path found, returns None.
+        """
         sx, sy = start.x, start.y
         gx, gy = goal.x, goal.y
 
         if (sx, sy) == (gx, gy):
             return None
+
         if not self._in_bounds(game_message, gx, gy):
             return None
+
         if (gx, gy) in blocked and not allow_goal_even_if_blocked:
             return None
 
-        open_heap: list[tuple[int, int, int, int]] = []
+        open_heap: list[tuple[int, int, int, int]] = []  # (f, g, x, y)
         heapq.heappush(open_heap, (self._heuristic(sx, sy, gx, gy), 0, sx, sy))
 
         came_from: dict[tuple[int, int], tuple[int, int]] = {}
         g_score: dict[tuple[int, int], int] = {(sx, sy): 0}
 
         expansions = 0
+
         while open_heap and expansions < self.astar_max_expansions:
             f, g, x, y = heapq.heappop(open_heap)
 
@@ -298,14 +324,18 @@ class Bot:
                 while prev is not None and prev != (sx, sy):
                     cur = prev
                     prev = came_from.get(cur)
+
                 nx, ny = cur
-                return Position(x=nx - sx, y=ny - sy)
+                dx = nx - sx
+                dy = ny - sy
+                return Position(x=dx, y=dy)
 
             expansions += 1
 
             for nx, ny, _dvec in self._adjacent_positions(x, y):
                 if not self._in_bounds(game_message, nx, ny):
                     continue
+
                 if (nx, ny) in blocked and not (allow_goal_even_if_blocked and (nx, ny) == (gx, gy)):
                     continue
 
@@ -333,32 +363,31 @@ class Bot:
         enemy_pos = self._enemy_spore_positions(game_message)
         enemy_spawner_pos = self._enemy_spawner_positions(game_message)
 
+        # Treat neutrals + enemies + enemy spawners as blocked by default
         blocked_for_path = set(neutral_pos) | set(enemy_pos) | set(enemy_spawner_pos)
 
-        # NEW 0) Tick 0: put a spawner on EVERY starting tile (every starting spore position)
+        # Tick 0: put a spawner on every starting tile (every starting spore position)
         if game_message.tick == 0 and not self._did_initial_spawner_burst:
             self._did_initial_spawner_burst = True
             for sp in my_team.spores:
                 actions.append(SporeCreateSpawnerAction(sporeId=sp.id))
-            return actions  # priority: do this immediately
+            return actions
 
-        # 1) PANIC: enemy close -> create a new spawner somewhere safer (if possible + cooldown)
+        # PANIC: enemy close -> create a new spawner somewhere safer (cooldown)
         enemy_threat = self._enemy_nearby(game_message, enemy_pos)
         if enemy_threat and (game_message.tick - self._last_panic_spawner_tick >= self.panic_spawner_cooldown):
-            if len(my_team.spores) > 0:
-                safest = self._pick_safest_spore_for_new_spawner(game_message, enemy_pos)
-                if safest is not None:
-                    if len(my_team.spawners) < 3:
-                        actions.append(SporeCreateSpawnerAction(sporeId=safest.id))
-                        self._last_panic_spawner_tick = game_message.tick
-                        return actions
+            safest = self._pick_safest_spore_for_new_spawner(game_message, enemy_pos)
+            if safest is not None and len(my_team.spawners) < 3:
+                actions.append(SporeCreateSpawnerAction(sporeId=safest.id))
+                self._last_panic_spawner_tick = game_message.tick
+                return actions
 
-        # 2) Ensure we have at least one spawner ASAP (fallback)
+        # Ensure we have a spawner ASAP (fallback)
         if len(my_team.spawners) == 0 and len(my_team.spores) > 0:
             actions.append(SporeCreateSpawnerAction(sporeId=my_team.spores[0].id))
             return actions
 
-        # 3) Constantly produce spores (if we can afford it)
+        # Constantly produce spores (if we can afford it)
         if len(my_team.spawners) > 0 and self.produce_every_tick:
             spawn_biomass = self._current_spawn_biomass(game_message.tick)
             if len(my_team.spores) < self.max_spores and my_team.nutrients >= spawn_biomass:
@@ -369,36 +398,55 @@ class Bot:
                     )
                 )
 
-        # 4) Sacrifice when surrounded
-        sacrificial_spore_id, sacrificial_move = self._choose_sacrifice_target(
-            game_message=game_message,
-            my_spores=my_team.spores,
-            neutral_pos=neutral_pos,
-            neutral_biomass=neutral_biomass,
-        )
-
-        # 5) Movement: attack enemy spawner if near, else expand
+        # ---------- MINIMAL CHANGE: only sacrifice if no unvisited targets exist ----------
+        any_unvisited_target = False
         for sp in my_team.spores:
+            if self._pick_unvisited_target(game_message, sp.position, blocked_for_path) is not None:
+                any_unvisited_target = True
+                break
+
+        if any_unvisited_target:
+            sacrificial_spore_id, sacrificial_move = None, None
+        else:
+            sacrificial_spore_id, sacrificial_move = self._choose_sacrifice_target(
+                game_message=game_message,
+                my_spores=my_team.spores,
+                neutral_pos=neutral_pos,
+                neutral_biomass=neutral_biomass,
+            )
+        # -------------------------------------------------------------------------------
+
+        # Movement: attack enemy spawner if near, else expand
+        for sp in my_team.spores:
+            # Sacrifice move overrides pathfinding (but only when expansion is impossible)
             if sacrificial_spore_id is not None and sp.id == sacrificial_spore_id:
                 actions.append(sacrificial_move)  # type: ignore[arg-type]
                 continue
 
+            # Attack nearby enemy spawner
             spawner_target = self._nearest_enemy_spawner_in_radius(
                 sp.position, enemy_spawner_pos, self.attack_spawner_radius
             )
 
             if spawner_target is not None:
                 target = spawner_target
-                allow_goal_blocked = True
+                allow_goal_blocked = True  # spawner is in blocked_for_path; allow stepping onto it
             else:
+                # Prefer exploration to unvisited tiles (avoid blocked tiles)
                 target = self._pick_unvisited_target(game_message, sp.position, blocked_for_path)
+
+                # If no unvisited target found, but neutrals are close, go clear a nearby neutral
                 if target is None:
-                    nearby_neutral = self._nearest_neutral_in_radius(sp.position, neutral_pos, self.neutral_clear_radius)
+                    nearby_neutral = self._nearest_neutral_in_radius(
+                        sp.position, neutral_pos, self.neutral_clear_radius
+                    )
                     if nearby_neutral is not None:
                         target = nearby_neutral
                     else:
                         w, h = game_message.world.map.width, game_message.world.map.height
                         target = Position(x=random.randint(0, w - 1), y=random.randint(0, h - 1))
+
+                # If target is a neutral tile, we allow goal to be "blocked" because we want to fight it.
                 allow_goal_blocked = (target.x, target.y) in neutral_pos
 
             next_dir = self._astar_next_step(
