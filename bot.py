@@ -17,14 +17,22 @@ class Bot:
         self.produce_every_tick: bool = True
 
         # Neutral handling knobs (lightweight)
-        self.surrounded_threshold: int = 3   # "surrounded" if >= 3 adjacent neutral spores
+        self.surrounded_threshold: int = 3
         self.neutral_clear_radius: int = 8
 
-        # NEW: attack enemy spawners if near
+        # Attack spawners if near
         self.attack_spawner_radius: int = 12
 
+        # Panic-spawner settings
+        self.enemy_threat_radius: int = 3
+        self.panic_spawner_cooldown: int = 30
+        self._last_panic_spawner_tick: int = -10**9
+
+        # NEW: only do the “spawner on every starting tile” once
+        self._did_initial_spawner_burst: bool = False
+
         # Pathfinding knobs
-        self.astar_max_expansions: int = 4000  # safety cap so we don't explode CPU
+        self.astar_max_expansions: int = 4000
 
     # ---------- basic helpers ----------
 
@@ -75,7 +83,6 @@ class Bot:
         return out
 
     def _enemy_spawner_positions(self, game_message: TeamGameState) -> set[tuple[int, int]]:
-        """All enemy spawner tile positions."""
         my_id = game_message.yourTeamId
         neutral_id = game_message.constants.neutralTeamId
         out: set[tuple[int, int]] = set()
@@ -83,6 +90,41 @@ class Bot:
             if spw.teamId != my_id and spw.teamId != neutral_id:
                 out.add((spw.position.x, spw.position.y))
         return out
+
+    def _manhattan(self, ax: int, ay: int, bx: int, by: int) -> int:
+        return abs(ax - bx) + abs(ay - by)
+
+    # ---------- threat + panic spawner ----------
+
+    def _enemy_nearby(self, game_message: TeamGameState, enemy_pos: set[tuple[int, int]]) -> bool:
+        my_team: TeamInfo = game_message.world.teamInfos[game_message.yourTeamId]
+        if not enemy_pos or not my_team.spores:
+            return False
+
+        r = self.enemy_threat_radius
+        for sp in my_team.spores:
+            sx, sy = sp.position.x, sp.position.y
+            for ex, ey in enemy_pos:
+                if self._manhattan(sx, sy, ex, ey) <= r:
+                    return True
+        return False
+
+    def _pick_safest_spore_for_new_spawner(
+        self,
+        game_message: TeamGameState,
+        enemy_pos: set[tuple[int, int]],
+    ) -> Optional[Spore]:
+        my_team: TeamInfo = game_message.world.teamInfos[game_message.yourTeamId]
+        if not my_team.spores:
+            return None
+        if not enemy_pos:
+            return max(my_team.spores, key=lambda s: (s.position.x, s.position.y))
+
+        def min_dist_to_enemy(sp: Spore) -> int:
+            sx, sy = sp.position.x, sp.position.y
+            return min(self._manhattan(sx, sy, ex, ey) for ex, ey in enemy_pos)
+
+        return max(my_team.spores, key=min_dist_to_enemy)
 
     # ---------- strategy target selection ----------
 
@@ -291,15 +333,32 @@ class Bot:
         enemy_pos = self._enemy_spore_positions(game_message)
         enemy_spawner_pos = self._enemy_spawner_positions(game_message)
 
-        # Treat neutrals + enemies + enemy spawners as blocked by default
         blocked_for_path = set(neutral_pos) | set(enemy_pos) | set(enemy_spawner_pos)
 
-        # 1) Ensure we have a spawner ASAP
+        # NEW 0) Tick 0: put a spawner on EVERY starting tile (every starting spore position)
+        if game_message.tick == 0 and not self._did_initial_spawner_burst:
+            self._did_initial_spawner_burst = True
+            for sp in my_team.spores:
+                actions.append(SporeCreateSpawnerAction(sporeId=sp.id))
+            return actions  # priority: do this immediately
+
+        # 1) PANIC: enemy close -> create a new spawner somewhere safer (if possible + cooldown)
+        enemy_threat = self._enemy_nearby(game_message, enemy_pos)
+        if enemy_threat and (game_message.tick - self._last_panic_spawner_tick >= self.panic_spawner_cooldown):
+            if len(my_team.spores) > 0:
+                safest = self._pick_safest_spore_for_new_spawner(game_message, enemy_pos)
+                if safest is not None:
+                    if len(my_team.spawners) < 3:
+                        actions.append(SporeCreateSpawnerAction(sporeId=safest.id))
+                        self._last_panic_spawner_tick = game_message.tick
+                        return actions
+
+        # 2) Ensure we have at least one spawner ASAP (fallback)
         if len(my_team.spawners) == 0 and len(my_team.spores) > 0:
             actions.append(SporeCreateSpawnerAction(sporeId=my_team.spores[0].id))
             return actions
 
-        # 2) Constantly produce spores (if we can afford it)
+        # 3) Constantly produce spores (if we can afford it)
         if len(my_team.spawners) > 0 and self.produce_every_tick:
             spawn_biomass = self._current_spawn_biomass(game_message.tick)
             if len(my_team.spores) < self.max_spores and my_team.nutrients >= spawn_biomass:
@@ -310,7 +369,7 @@ class Bot:
                     )
                 )
 
-        # 3) Sacrifice when surrounded
+        # 4) Sacrifice when surrounded
         sacrificial_spore_id, sacrificial_move = self._choose_sacrifice_target(
             game_message=game_message,
             my_spores=my_team.spores,
@@ -318,33 +377,28 @@ class Bot:
             neutral_biomass=neutral_biomass,
         )
 
-        # 4) Movement: if enemy spawner is nearby, ATTACK it. Otherwise expand.
+        # 5) Movement: attack enemy spawner if near, else expand
         for sp in my_team.spores:
             if sacrificial_spore_id is not None and sp.id == sacrificial_spore_id:
                 actions.append(sacrificial_move)  # type: ignore[arg-type]
                 continue
 
-            # NEW PRIORITY: attack nearby enemy spawner
             spawner_target = self._nearest_enemy_spawner_in_radius(
                 sp.position, enemy_spawner_pos, self.attack_spawner_radius
             )
 
             if spawner_target is not None:
                 target = spawner_target
-                allow_goal_blocked = True  # enemy spawner tile is in blocked_for_path; allow stepping onto it
+                allow_goal_blocked = True
             else:
                 target = self._pick_unvisited_target(game_message, sp.position, blocked_for_path)
-
                 if target is None:
-                    nearby_neutral = self._nearest_neutral_in_radius(
-                        sp.position, neutral_pos, self.neutral_clear_radius
-                    )
+                    nearby_neutral = self._nearest_neutral_in_radius(sp.position, neutral_pos, self.neutral_clear_radius)
                     if nearby_neutral is not None:
                         target = nearby_neutral
                     else:
                         w, h = game_message.world.map.width, game_message.world.map.height
                         target = Position(x=random.randint(0, w - 1), y=random.randint(0, h - 1))
-
                 allow_goal_blocked = (target.x, target.y) in neutral_pos
 
             next_dir = self._astar_next_step(
